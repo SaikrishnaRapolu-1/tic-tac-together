@@ -6,8 +6,14 @@ import './styles.css';
 const url = import.meta.env.VITE_SUPABASE_URL;
 const key = import.meta.env.VITE_SUPABASE_ANON_KEY;
 const supabase = url && key ? createClient(url, key) : null;
-const clientId = localStorage.getItem('ttt-player-id') || crypto.randomUUID();
-localStorage.setItem('ttt-player-id', clientId);
+let clientId = null;
+async function ensurePlayer() {
+  const { data: { session } } = await supabase.auth.getSession();
+  if (session) { clientId = session.user.id; return; }
+  const { data, error } = await supabase.auth.signInAnonymously();
+  if (error) throw error;
+  clientId = data.user.id;
+}
 const lines = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
 const newId = () => crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase();
 const outcome = (board) => {
@@ -50,6 +56,7 @@ function App() {
   }, []);
 
   async function loadRoom(id) {
+    try { await ensurePlayer(); } catch { setLoading(false); return setMessage('Could not connect. Anonymous sign-ins must be enabled.'); }
     const { data, error } = await supabase.from('games').select('state').eq('id', id).maybeSingle();
     setLoading(false);
     if (error || !data) { setMessage('That room could not be found. Ask your friend for a fresh invite link.'); return; }
@@ -59,6 +66,7 @@ function App() {
   async function createRoom() {
     if (!name) return setMessage('Enter your name first.');
     if (!supabase) return setMessage('Supabase is not configured yet.');
+    try { await ensurePlayer(); } catch { return setMessage('Could not sign in. Enable anonymous sign-ins in Supabase.'); }
     const id = newId(), state = initialState(name);
     const { error } = await supabase.from('games').insert({ id, state });
     if (error) return setMessage(`Could not create room: ${error.message}`);
@@ -75,7 +83,7 @@ function App() {
     const { data, error } = await supabase.from('games').update({ state: next, updated_at: new Date().toISOString() }).eq('id', room).eq('state->>version', String(game.version)).select('id');
     if (error) return setMessage('Could not save. Check your connection and try again.');
     if (!data?.length) { setMessage('Another update arrived first. Please try again.'); await loadRoom(room); }
-    else { setGame(next); setMessage(''); }
+    else { await loadRoom(room); setMessage(''); }
   }
   async function play(i) {
     if (!game || game.status !== 'playing' || game.result || game.board[i]) return;
