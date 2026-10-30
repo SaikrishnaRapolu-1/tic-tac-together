@@ -6,13 +6,15 @@ import './styles.css';
 const url = import.meta.env.VITE_SUPABASE_URL;
 const key = import.meta.env.VITE_SUPABASE_ANON_KEY;
 const supabase = url && key ? createClient(url, key) : null;
+const clientId = localStorage.getItem('ttt-player-id') || crypto.randomUUID();
+localStorage.setItem('ttt-player-id', clientId);
 const lines = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
 const newId = () => crypto.randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase();
 const outcome = (board) => {
   const line = lines.find(([a,b,c]) => board[a] && board[a] === board[b] && board[a] === board[c]);
   return line ? { winner: board[line[0]], line } : board.every(Boolean) ? { winner: 'draw', line: [] } : null;
 };
-const initialState = (host) => ({ board: Array(9).fill(null), players: { X: host, O: null }, turn: 'X', scores: { X: 0, O: 0 }, status: 'waiting', result: null, version: 1 });
+const initialState = (host) => ({ board: Array(9).fill(null), players: { X: host, O: null }, playerIds: { X: clientId, O: null }, turn: 'X', scores: { X: 0, O: 0 }, status: 'waiting', result: null, version: 1 });
 
 function App() {
   const params = new URLSearchParams(location.search);
@@ -28,15 +30,16 @@ function App() {
   const share = useMemo(() => room ? `${location.origin}${location.pathname}?room=${room}` : '', [room]);
 
   useEffect(() => {
-    if (!supabase) return;
+    if (!supabase || !room) return;
     const channel = supabase.channel(`game-${room}`).on('postgres_changes', { event: '*', schema: 'public', table: 'games', filter: `id=eq.${room}` }, p => {
       if (p.new?.state) { setGame(p.new.state); setLoading(false); }
       if (p.eventType === 'DELETE') setGame(null);
     }).on('presence', { event: 'sync' }, () => {
-      const names = Object.values(channel.presenceState()).flat().map(p => p.name);
-      setOpponentOnline(!game?.players?.O || names.some(n => n !== name));
+      const peers = Object.values(channel.presenceState()).flat();
+      setOpponentOnline(peers.some(p => p.id !== clientId));
     }).subscribe(status => {
-      if (status === 'SUBSCRIBED' && name) channel.track({ name, online_at: new Date().toISOString() });
+      if (status === 'SUBSCRIBED') { channel.track({ id: clientId }); loadRoom(room); }
+      if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') setMessage('Connection interrupted. Reconnecting…');
     });
     return () => supabase.removeChannel(channel);
   }, [room, name]);
@@ -65,16 +68,18 @@ function App() {
     if (!name) return setMessage('Enter your name first.');
     if (!game) return;
     if (game.players.O) return setMessage('This room already has two players.');
-    await update({ ...game, players: { ...game.players, O: name }, status: 'playing', version: game.version + 1 });
+    await update({ ...game, players: { ...game.players, O: name }, playerIds: { ...game.playerIds, O: clientId }, status: 'playing', version: game.version + 1 });
   }
   async function update(next) {
     if (!supabase) return;
     const { data, error } = await supabase.from('games').update({ state: next, updated_at: new Date().toISOString() }).eq('id', room).eq('state->>version', String(game.version)).select('id');
-    if (error || !data?.length) setMessage('That move arrived after a newer update — the board has refreshed.');
+    if (error) return setMessage('Could not save. Check your connection and try again.');
+    if (!data?.length) { setMessage('Another update arrived first. Please try again.'); await loadRoom(room); }
+    else { setGame(next); setMessage(''); }
   }
   async function play(i) {
     if (!game || game.status !== 'playing' || game.result || game.board[i]) return;
-    const me = game.players.X === name ? 'X' : game.players.O === name ? 'O' : null;
+    const me = game.playerIds?.X === clientId ? 'X' : game.playerIds?.O === clientId ? 'O' : null;
     if (me !== game.turn) return setMessage(`It’s ${game.players[game.turn] || game.turn}’s turn.`);
     const board = [...game.board]; board[i] = me;
     const result = outcome(board); const scores = { ...game.scores };
@@ -83,13 +88,14 @@ function App() {
   }
   async function rematch() { if (game) await update({ ...game, board: Array(9).fill(null), turn: 'X', result: null, status: 'playing', version: game.version + 1 }); }
   async function copy() { await navigator.clipboard.writeText(share); setCopied(true); setTimeout(() => setCopied(false), 1800); }
-  const playerSymbol = game && (game.players.X === name ? 'X' : game.players.O === name ? 'O' : null);
+  const playerSymbol = game && (game.playerIds?.X === clientId ? 'X' : game.playerIds?.O === clientId ? 'O' : null);
 
   return <main>
     <header><a className="brand" href="/">tic<span>•</span>tac<span>•</span>together</a><div className="pill"><i></i> Live multiplayer</div></header>
     {!supabase && <div className="setup">Demo UI only — add Supabase keys to enable live games.</div>}
+    {room && game && !playerSymbol && <div className="namebox"><label htmlFor="join-name">Your display name</label><div><input id="join-name" maxLength="20" value={draft} onChange={e=>setDraft(e.target.value)} placeholder="e.g. Jamie"/><button onClick={saveName}>Save</button></div>{game.status === 'waiting' && name && <button className="primary" onClick={join}>Join game as O</button>}</div>}
     {!room && <section className="hero"><div><p className="eyebrow">THE CLASSIC, CONNECTED</p><h1>Three in a row.<br/><em>Together.</em></h1><p className="lede">A joyful little game for two people, wherever you are.</p><div className="namebox"><label>Your display name</label><div><input maxLength="20" value={draft} onChange={e=>setDraft(e.target.value)} onKeyDown={e=>e.key==='Enter'&&saveName()} placeholder="e.g. Jamie"/><button onClick={saveName}>Save</button></div></div>{name && <button className="primary" onClick={createRoom}>Create a game <b>→</b></button>}{message && <p className="notice">{message}</p>}</div><aside><div className="mini"><span>×</span><span>○</span><span>×</span><span>○</span><span>×</span><span>○</span><span>×</span><span>○</span><span>×</span></div><p>Make a room, share the link,<br/>and take the first move.</p></aside></section>}
-    {room && <section className="gamewrap">{loading ? <p className="loading">Finding your game…</p> : !game ? <div className="missing"><h2>Room unavailable</h2><p>{message}</p><a href="/">Create a new game</a></div> : <><div className="roomtop"><div><p className="eyebrow">ROOM {room}</p><h2>{game.status === 'waiting' ? 'Waiting for a challenger' : game.result ? (game.result.winner === 'draw' ? 'A perfectly even match' : `${game.players[game.result.winner]} wins!`) : `${game.players[game.turn]}’s turn`}</h2></div><button className="share" onClick={copy}>{copied ? 'Link copied!' : 'Share invite ↗'}</button></div><div className="playarea"><div className="scorecard"><div className={game.turn==='X'&&!game.result?'active':''}><b className="x">×</b><span>{game.players.X}</span><strong>{game.scores.X}</strong></div><div className={game.turn==='O'&&!game.result?'active':''}><b className="o">○</b><span>{game.players.O || 'Waiting…'}</span><strong>{game.scores.O}</strong></div></div><div className="board" aria-label="Tic tac toe board">{game.board.map((v,i)=><button key={i} onClick={()=>play(i)} className={(game.result?.line||[]).includes(i)?'win':''} disabled={!!v || !!game.result}>{v === 'X' ? '×' : v === 'O' ? '○' : ''}</button>)}</div><p className="status">{game.status==='waiting' ? 'Invite someone with the link above to start.' : !opponentOnline && game.players.O ? 'Your opponent has disconnected. Their board will be ready when they return.' : game.result ? 'Want another round? The score stays.' : playerSymbol ? `You’re ${playerSymbol}. Choose an open square on your turn.` : 'You’re watching this match.'}</p>{game.status==='waiting' && !game.players.O && name !== game.players.X && <button className="primary" onClick={join}>Join as O</button>}{game.result && playerSymbol && <button className="primary" onClick={rematch}>Play again <b>↻</b></button>}{message && <p className="notice">{message}</p>}</div><footer><span>How to play</span><p>Players take turns placing their mark. First to make three in a row wins. If every square fills, it’s a draw.</p></footer></div></>}</section>}
+    {room && <section className="gamewrap">{loading ? <p className="loading">Finding your game…</p> : !game ? <div className="missing"><h2>Room unavailable</h2><p>{message}</p><a href="/">Create a new game</a></div> : <><div className="roomtop"><div><p className="eyebrow">ROOM {room}</p><h2>{game.status === 'waiting' ? 'Waiting for a challenger' : game.result ? (game.result.winner === 'draw' ? 'A perfectly even match' : `${game.players[game.result.winner]} wins!`) : `${game.players[game.turn]}’s turn`}</h2></div><button className="share" onClick={copy}>{copied ? 'Link copied!' : 'Share invite ↗'}</button></div><div className="playarea"><div className="scorecard"><div className={game.turn==='X'&&!game.result?'active':''}><b className="x">×</b><span>{game.players.X}</span><strong>{game.scores.X}</strong></div><div className={game.turn==='O'&&!game.result?'active':''}><b className="o">○</b><span>{game.players.O || 'Waiting…'}</span><strong>{game.scores.O}</strong></div></div><div className="board" aria-label="Tic tac toe board">{game.board.map((v,i)=><button key={i} onClick={()=>play(i)} className={(game.result?.line||[]).includes(i)?'win':''} disabled={!!v || !!game.result}>{v === 'X' ? '×' : v === 'O' ? '○' : ''}</button>)}</div><p className="status">{game.status==='waiting' ? 'Invite someone with the link above to start.' : !opponentOnline && game.players.O ? 'Your opponent has disconnected. Their board will be ready when they return.' : game.result ? 'Want another round? The score stays.' : playerSymbol ? `You’re ${playerSymbol}. Choose an open square on your turn.` : 'You’re watching this match.'}</p>{game.status==='waiting' && !game.players.O && name && !playerSymbol && <button className="primary" onClick={join}>Join as O</button>}{game.result && playerSymbol && <button className="primary" onClick={rematch}>Play again <b>↻</b></button>}{message && <p className="notice">{message}</p>}</div><footer><span>How to play</span><p>Players take turns placing their mark. First to make three in a row wins. If every square fills, it’s a draw.</p></footer></>}</section>}
   </main>;
 }
 createRoot(document.getElementById('root')).render(<App/>);
